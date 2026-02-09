@@ -285,38 +285,40 @@ def train_baseline(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
     rngs = nnx.Rngs(default=42)
     model = BaselineFlux(config, rngs)
     
-    # Setup optimizer
+    # Setup optimizer with nnx.Optimizer
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.lr,
         warmup_steps=config.warmup_steps,
         decay_steps=config.steps,
     )
-    optimizer = optax.adam(schedule)
-    opt_state = optimizer.init(nnx.state(model.model))
+    optimizer = nnx.Optimizer(model.model, optax.adam(schedule))
     
     metrics = {"loss": [], "step_time": []}
     
-    def loss_fn(model_state, batch):
-        nnx.update(model.model, model_state)
-        output = model(batch)
-        return compute_loss(output, batch["target"])
+    @nnx.jit
+    def train_step(model, optimizer, batch):
+        def loss_fn(model):
+            output = model(
+                img=batch["img"],
+                img_ids=batch["img_ids"],
+                txt=batch["txt"],
+                txt_ids=batch["txt_ids"],
+                timesteps=batch["timesteps"],
+                y=batch["y"],
+            )
+            return compute_loss(output, batch["target"])
+        
+        loss, grads = nnx.value_and_grad(loss_fn)(model)
+        optimizer.update(grads)
+        return loss
     
     for step in range(config.steps):
         key, batch_key = jax.random.split(key)
         batch = create_batch(config, batch_key)
         
         start_time = time.time()
-        
-        # Compute loss and gradients
-        model_state = nnx.state(model.model)
-        loss, grads = jax.value_and_grad(loss_fn)(model_state, batch)
-        
-        # Update
-        updates, opt_state = optimizer.update(grads, opt_state, model_state)
-        new_state = optax.apply_updates(model_state, updates)
-        nnx.update(model.model, new_state)
-        
+        loss = train_step(model.model, optimizer, batch)
         step_time = time.time() - start_time
         
         metrics["loss"].append(float(loss))
@@ -341,40 +343,73 @@ def train_static_alpha(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
     print(f"Using pre-learned alphas: {LEARNED_STATIC_ALPHAS[:config.depth + config.depth_single_blocks]}")
     
     rngs = nnx.Rngs(default=42)
-    model = StaticAlphaFlux(config, rngs)
+    wrapper = StaticAlphaFlux(config, rngs)
     
-    # Setup optimizer
+    # Setup optimizer with nnx.Optimizer
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.lr,
         warmup_steps=config.warmup_steps,
         decay_steps=config.steps,
     )
-    optimizer = optax.adam(schedule)
-    opt_state = optimizer.init(nnx.state(model.model))
+    optimizer = nnx.Optimizer(wrapper.model, optax.adam(schedule))
     
     metrics = {"loss": [], "step_time": []}
+    alphas = wrapper.alphas
     
-    def loss_fn(model_state, batch):
-        nnx.update(model.model, model_state)
-        output = model(batch)
-        return compute_loss(output, batch["target"])
+    def forward_with_static_alpha(model, batch, alphas):
+        """Forward pass with static alpha hyper-connections."""
+        # Process inputs
+        img = model.img_in(batch["img"])
+        txt = model.txt_in(batch["txt"])
+        vec = model.time_in(timestep_embedding(batch["timesteps"], 256))
+        vec = vec + model.vector_in(batch["y"])
+        
+        ids = jnp.concatenate((batch["txt_ids"], batch["img_ids"]), axis=1)
+        pe = model.pe_embedder(ids)
+        
+        # Double blocks with static alpha
+        prev_img = None
+        block_idx = 0
+        for block in model.double_blocks.layers:
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+            if prev_img is not None:
+                alpha = alphas[block_idx]
+                img = alpha * img + (1 - alpha) * prev_img
+            prev_img = img
+            block_idx += 1
+        
+        # Single blocks with static alpha
+        img = jnp.concatenate((txt, img), axis=1)
+        prev_single = None
+        for block in model.single_blocks.layers:
+            img = block(img, vec=vec, pe=pe)
+            if prev_single is not None:
+                alpha = alphas[block_idx]
+                img = alpha * img + (1 - alpha) * prev_single
+            prev_single = img
+            block_idx += 1
+        
+        img = img[:, batch["txt"].shape[1]:, ...]
+        img = model.final_layer(img, vec)
+        return img
+    
+    @nnx.jit
+    def train_step(model, optimizer, batch, alphas):
+        def loss_fn(model):
+            output = forward_with_static_alpha(model, batch, alphas)
+            return compute_loss(output, batch["target"])
+        
+        loss, grads = nnx.value_and_grad(loss_fn)(model)
+        optimizer.update(grads)
+        return loss
     
     for step in range(config.steps):
         key, batch_key = jax.random.split(key)
         batch = create_batch(config, batch_key)
         
         start_time = time.time()
-        
-        # Compute loss and gradients
-        model_state = nnx.state(model.model)
-        loss, grads = jax.value_and_grad(loss_fn)(model_state, batch)
-        
-        # Update
-        updates, opt_state = optimizer.update(grads, opt_state, model_state)
-        new_state = optax.apply_updates(model_state, updates)
-        nnx.update(model.model, new_state)
-        
+        loss = train_step(wrapper.model, optimizer, batch, alphas)
         step_time = time.time() - start_time
         
         metrics["loss"].append(float(loss))
@@ -398,29 +433,80 @@ def train_dynamic_mhc(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
     print("=" * 60)
     
     rngs = nnx.Rngs(default=42)
-    model = DynamicMHCFlux(config, rngs)
+    wrapper = DynamicMHCFlux(config, rngs)
     
-    # Setup optimizer for both model params and alpha logits
+    # Setup optimizer for model params with nnx.Optimizer
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
         peak_value=config.lr,
         warmup_steps=config.warmup_steps,
         decay_steps=config.steps,
     )
+    model_optimizer = nnx.Optimizer(wrapper.model, optax.adam(schedule))
     
-    # Separate optimizers: lower LR for model, higher for alphas
-    model_optimizer = optax.adam(schedule)
-    alpha_optimizer = optax.adam(0.01)  # Higher LR for alpha learning
-    
-    model_opt_state = model_optimizer.init(nnx.state(model.model))
-    alpha_opt_state = alpha_optimizer.init(model.alpha_logits)
+    # Separate optimizer for alpha logits (higher LR)
+    alpha_optimizer = optax.adam(0.01)
+    alpha_opt_state = alpha_optimizer.init(wrapper.alpha_logits)
     
     metrics = {"loss": [], "step_time": [], "alpha_mean": [], "alpha_std": []}
     
-    def loss_fn(model_state, alpha_logits, batch):
-        nnx.update(model.model, model_state)
-        output = model(batch, alpha_logits)
-        return compute_loss(output, batch["target"])
+    def forward_with_dynamic_alpha(model, batch, alpha_logits):
+        """Forward pass with dynamic alpha hyper-connections."""
+        alphas = nnx.sigmoid(alpha_logits)
+        
+        # Process inputs
+        img = model.img_in(batch["img"])
+        txt = model.txt_in(batch["txt"])
+        vec = model.time_in(timestep_embedding(batch["timesteps"], 256))
+        vec = vec + model.vector_in(batch["y"])
+        
+        ids = jnp.concatenate((batch["txt_ids"], batch["img_ids"]), axis=1)
+        pe = model.pe_embedder(ids)
+        
+        # Double blocks with dynamic alpha
+        prev_img = None
+        block_idx = 0
+        for block in model.double_blocks.layers:
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+            if prev_img is not None:
+                alpha = alphas[block_idx]
+                img = alpha * img + (1 - alpha) * prev_img
+            prev_img = img
+            block_idx += 1
+        
+        # Single blocks with dynamic alpha
+        img = jnp.concatenate((txt, img), axis=1)
+        prev_single = None
+        for block in model.single_blocks.layers:
+            img = block(img, vec=vec, pe=pe)
+            if prev_single is not None:
+                alpha = alphas[block_idx]
+                img = alpha * img + (1 - alpha) * prev_single
+            prev_single = img
+            block_idx += 1
+        
+        img = img[:, batch["txt"].shape[1]:, ...]
+        img = model.final_layer(img, vec)
+        return img
+    
+    # Compute gradients separately for model and alphas
+    def compute_alpha_grads(model, batch, alpha_logits):
+        """Compute gradients w.r.t. alpha_logits only."""
+        def alpha_loss_fn(alpha_logits):
+            output = forward_with_dynamic_alpha(model, batch, alpha_logits)
+            return compute_loss(output, batch["target"])
+        return jax.value_and_grad(alpha_loss_fn)(alpha_logits)
+    
+    @nnx.jit
+    def train_model_step(model, model_optimizer, batch, alpha_logits):
+        """Train step for model parameters only."""
+        def loss_fn(model):
+            output = forward_with_dynamic_alpha(model, batch, alpha_logits)
+            return compute_loss(output, batch["target"])
+        
+        loss, grads = nnx.value_and_grad(loss_fn)(model)
+        model_optimizer.update(grads)
+        return loss
     
     for step in range(config.steps):
         key, batch_key = jax.random.split(key)
@@ -428,28 +514,19 @@ def train_dynamic_mhc(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
         
         start_time = time.time()
         
-        # Compute loss and gradients for both model and alphas
-        model_state = nnx.state(model.model)
-        (loss, (model_grads, alpha_grads)) = jax.value_and_grad(
-            loss_fn, argnums=(0, 1)
-        )(model_state, model.alpha_logits, batch)
-        
         # Update model params
-        model_updates, model_opt_state = model_optimizer.update(
-            model_grads, model_opt_state, model_state
-        )
-        new_model_state = optax.apply_updates(model_state, model_updates)
-        nnx.update(model.model, new_model_state)
+        loss = train_model_step(wrapper.model, model_optimizer, batch, wrapper.alpha_logits)
         
-        # Update alpha logits
+        # Update alpha logits separately
+        _, alpha_grads = compute_alpha_grads(wrapper.model, batch, wrapper.alpha_logits)
         alpha_updates, alpha_opt_state = alpha_optimizer.update(
-            alpha_grads, alpha_opt_state, model.alpha_logits
+            alpha_grads, alpha_opt_state, wrapper.alpha_logits
         )
-        model.alpha_logits = optax.apply_updates(model.alpha_logits, alpha_updates)
+        wrapper.alpha_logits = optax.apply_updates(wrapper.alpha_logits, alpha_updates)
         
         step_time = time.time() - start_time
         
-        current_alphas = model.get_alphas()
+        current_alphas = wrapper.get_alphas()
         metrics["loss"].append(float(loss))
         metrics["step_time"].append(step_time)
         metrics["alpha_mean"].append(sum(current_alphas) / len(current_alphas))
@@ -477,7 +554,7 @@ def train_dynamic_mhc(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
                 wandb.log({f"dynamic_mhc/alpha_{i}": alpha, "step": step})
     
     # Log final alphas
-    final_alphas = model.get_alphas()
+    final_alphas = wrapper.get_alphas()
     print("\nFinal learned alphas:")
     for i, alpha in enumerate(final_alphas):
         block_type = "double" if i < config.depth else "single"
