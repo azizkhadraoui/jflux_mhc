@@ -288,9 +288,10 @@ def analyze_gradient_flow(
         "gradient_stats": {},
     }
     
-    grad_state = nnx.state(grads)
+    # Use jax tree utilities to iterate over gradients
+    flat_grads, tree_def = jax.tree_util.tree_flatten_with_path(grads)
     
-    for path, value in grad_state.flat_state().items():
+    for path, value in flat_grads:
         if value is None:
             continue
         
