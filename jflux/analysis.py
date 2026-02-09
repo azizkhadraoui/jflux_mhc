@@ -463,6 +463,8 @@ def run_probe_training(config: AnalysisConfig):
             
             # Single blocks with MHC  
             img = jnp.concatenate((txt, img), axis=1)
+            # Reset history since shape changed (img only -> txt+img concatenated)
+            mhc_manager.reset()
             for block in model.single_blocks.layers:
                 img = block(img, vec=vec, pe=pe)
                 img = mhc_manager.apply(block_idx, img)
