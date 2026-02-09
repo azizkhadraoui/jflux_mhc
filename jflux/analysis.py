@@ -61,6 +61,8 @@ class AnalysisConfig:
 
 def get_tiny_flux_params(config: AnalysisConfig, rngs: nnx.Rngs) -> FluxParams:
     """Create params for a tiny Flux model (fast iteration)."""
+    # pe_dim = hidden_size // num_heads, axes_dim must sum to pe_dim
+    pe_dim = config.hidden_size // config.num_heads  # 768 // 12 = 64
     return FluxParams(
         in_channels=64,
         vec_in_dim=768,
@@ -70,7 +72,7 @@ def get_tiny_flux_params(config: AnalysisConfig, rngs: nnx.Rngs) -> FluxParams:
         num_heads=config.num_heads,
         depth=config.depth,
         depth_single_blocks=config.depth_single_blocks,
-        axes_dim=[16, 28, 28],  # adjusted for smaller hidden_size
+        axes_dim=[16, 24, 24],  # sum = 64 = pe_dim
         theta=10_000,
         qkv_bias=True,
         guidance_embed=False,
