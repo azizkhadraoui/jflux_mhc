@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -203,40 +204,38 @@ def run_activation_analysis(config: AnalysisConfig):
     print("\nRunning activation analysis...")
     results = analyze_activations(model, batch, config)
     
-    # Log to W&B
+    # Create W&B Tables for better visualization
+    # Table for activation norms per layer
+    norm_table = wandb.Table(columns=["layer_idx", "block_type", "norm"])
     for i, norm in enumerate(results["double_block_img_norms"]):
-        wandb.log({
-            "activation/double_block_img_norm": norm,
-            "layer_idx": i,
-        })
-    
+        norm_table.add_data(i, "double_block", norm)
     for i, norm in enumerate(results["single_block_norms"]):
-        wandb.log({
-            "activation/single_block_norm": norm,
-            "layer_idx": config.depth + i,
-        })
+        norm_table.add_data(config.depth + i, "single_block", norm)
     
+    # Table for correlations
+    corr_table = wandb.Table(columns=["layer_idx", "block_type", "correlation"])
     for i, corr in enumerate(results["double_block_img_correlations"]):
-        wandb.log({
-            "activation/double_block_correlation": corr,
-            "layer_idx": i + 1,
-        })
-    
+        corr_table.add_data(i + 1, "double_block", corr)
     for i, corr in enumerate(results["single_block_correlations"]):
-        wandb.log({
-            "activation/single_block_correlation": corr,
-            "layer_idx": config.depth + i + 1,
-        })
+        corr_table.add_data(config.depth + i + 1, "single_block", corr)
+    
+    # Log tables as charts
+    wandb.log({
+        "activation_norms": wandb.plot.bar(norm_table, "layer_idx", "norm", title="Activation Norms per Layer"),
+        "correlations": wandb.plot.bar(corr_table, "layer_idx", "correlation", title="Cross-Layer Correlations"),
+    })
     
     # Summary stats
     avg_double_corr = sum(results["double_block_img_correlations"]) / len(results["double_block_img_correlations"]) if results["double_block_img_correlations"] else 0
     avg_single_corr = sum(results["single_block_correlations"]) / len(results["single_block_correlations"]) if results["single_block_correlations"] else 0
+    norm_decay_double = results["double_block_img_norms"][-1] / results["double_block_img_norms"][0] if results["double_block_img_norms"] else 1
+    norm_decay_single = results["single_block_norms"][-1] / results["single_block_norms"][0] if results["single_block_norms"] else 1
     
     wandb.log({
         "summary/avg_double_block_correlation": avg_double_corr,
         "summary/avg_single_block_correlation": avg_single_corr,
-        "summary/norm_decay_double": results["double_block_img_norms"][-1] / results["double_block_img_norms"][0] if results["double_block_img_norms"] else 1,
-        "summary/norm_decay_single": results["single_block_norms"][-1] / results["single_block_norms"][0] if results["single_block_norms"] else 1,
+        "summary/norm_decay_double": norm_decay_double,
+        "summary/norm_decay_single": norm_decay_single,
     })
     
     print("\n" + "=" * 60)
@@ -245,8 +244,8 @@ def run_activation_analysis(config: AnalysisConfig):
     print(f"Avg double block correlation: {avg_double_corr:.4f}")
     print(f"Avg single block correlation: {avg_single_corr:.4f}")
     print(f"  → High correlation (>0.8) suggests MHC can exploit redundancy")
-    print(f"\nNorm decay (double): {results['double_block_img_norms'][-1] / results['double_block_img_norms'][0]:.4f}")
-    print(f"Norm decay (single): {results['single_block_norms'][-1] / results['single_block_norms'][0]:.4f}")
+    print(f"\nNorm decay (double): {norm_decay_double:.4f}")
+    print(f"Norm decay (single): {norm_decay_single:.4f}")
     print(f"  → Ratio far from 1.0 suggests gradient flow issues")
     
     wandb.finish()
@@ -337,42 +336,113 @@ def run_gradient_analysis(config: AnalysisConfig):
     
     print(f"\nLoss: {results['loss']:.6f}")
     
-    # Group gradients by layer type
+    # Group gradients by layer type and block index
     double_block_norms = []
     single_block_norms = []
+    all_grad_norms = []
+    
+    # Create table for detailed gradient data
+    grad_table = wandb.Table(columns=["block_type", "block_idx", "layer_type", "param_type", "norm"])
     
     for path, norm in results["gradient_norms"].items():
-        wandb.log({"gradient/norm/" + path: norm})
+        # Parse the path to extract useful info
+        block_type = "double" if "double_blocks" in path else "single" if "single_blocks" in path else "other"
+        param_type = "kernel" if "kernel" in path else "bias" if "bias" in path else "scale" if "scale" in path else "other"
+        
+        # Extract block index
+        block_idx = -1
+        if "layers" in path:
+            try:
+                # Find block index from path like ['layers'].[0]
+                match = re.search(r"\[(\d+)\]", path)
+                if match:
+                    block_idx = int(match.group(1))
+            except:
+                pass
+        
+        # Classify layer type
+        layer_type = "unknown"
+        if "attn" in path.lower():
+            layer_type = "attention"
+        elif "mlp" in path.lower():
+            layer_type = "mlp"
+        elif "norm" in path.lower():
+            layer_type = "norm"
+        elif "mod" in path.lower():
+            layer_type = "modulation"
+        
+        grad_table.add_data(block_type, block_idx, layer_type, param_type, norm)
+        all_grad_norms.append(norm)
         
         if "double_blocks" in path and "kernel" in path:
-            double_block_norms.append(norm)
+            double_block_norms.append((block_idx, norm))
         elif "single_blocks" in path and "kernel" in path:
-            single_block_norms.append(norm)
+            single_block_norms.append((block_idx, norm))
     
-    # Summary
-    if double_block_norms:
+    # Log gradient table
+    wandb.log({"gradient_details": grad_table})
+    
+    # Create per-block summary table
+    block_summary_table = wandb.Table(columns=["block_idx", "block_type", "mean_grad_norm"])
+    
+    # Aggregate by block for double blocks
+    double_by_block = {}
+    for idx, norm in double_block_norms:
+        if idx not in double_by_block:
+            double_by_block[idx] = []
+        double_by_block[idx].append(norm)
+    
+    for idx in sorted(double_by_block.keys()):
+        mean_norm = sum(double_by_block[idx]) / len(double_by_block[idx])
+        block_summary_table.add_data(idx, "double", mean_norm)
+    
+    # Aggregate by block for single blocks
+    single_by_block = {}
+    for idx, norm in single_block_norms:
+        if idx not in single_by_block:
+            single_by_block[idx] = []
+        single_by_block[idx].append(norm)
+    
+    for idx in sorted(single_by_block.keys()):
+        mean_norm = sum(single_by_block[idx]) / len(single_by_block[idx])
+        block_summary_table.add_data(config.depth + idx, "single", mean_norm)
+    
+    # Log summary chart
+    wandb.log({
+        "gradient_norms_by_block": wandb.plot.bar(
+            block_summary_table, "block_idx", "mean_grad_norm", 
+            title="Mean Gradient Norm per Block"
+        ),
+        "gradient_histogram": wandb.Histogram(all_grad_norms),
+    })
+    
+    # Summary stats
+    double_norms_only = [n for _, n in double_block_norms]
+    single_norms_only = [n for _, n in single_block_norms]
+    
+    if double_norms_only:
         wandb.log({
-            "summary/double_block_grad_mean": sum(double_block_norms) / len(double_block_norms),
-            "summary/double_block_grad_std": float(jnp.std(jnp.array(double_block_norms))),
-            "summary/double_block_grad_max": max(double_block_norms),
-            "summary/double_block_grad_min": min(double_block_norms),
+            "summary/double_block_grad_mean": sum(double_norms_only) / len(double_norms_only),
+            "summary/double_block_grad_std": float(jnp.std(jnp.array(double_norms_only))),
+            "summary/double_block_grad_max": max(double_norms_only),
+            "summary/double_block_grad_min": min(double_norms_only),
         })
         print(f"\nDouble block gradient norms:")
-        print(f"  Mean: {sum(double_block_norms) / len(double_block_norms):.6f}")
-        print(f"  Std:  {float(jnp.std(jnp.array(double_block_norms))):.6f}")
-        print(f"  Range: [{min(double_block_norms):.6f}, {max(double_block_norms):.6f}]")
+        print(f"  Mean: {sum(double_norms_only) / len(double_norms_only):.6f}")
+        print(f"  Std:  {float(jnp.std(jnp.array(double_norms_only))):.6f}")
+        print(f"  Range: [{min(double_norms_only):.6f}, {max(double_norms_only):.6f}]")
     
-    if single_block_norms:
+    if single_norms_only:
         wandb.log({
-            "summary/single_block_grad_mean": sum(single_block_norms) / len(single_block_norms),
-            "summary/single_block_grad_std": float(jnp.std(jnp.array(single_block_norms))),
-            "summary/single_block_grad_max": max(single_block_norms),
-            "summary/single_block_grad_min": min(single_block_norms),
+            "summary/single_block_grad_mean": sum(single_norms_only) / len(single_norms_only),
+            "summary/single_block_grad_std": float(jnp.std(jnp.array(single_norms_only))),
+            "summary/single_block_grad_max": max(single_norms_only),
+            "summary/single_block_grad_min": min(single_norms_only),
         })
         print(f"\nSingle block gradient norms:")
-        print(f"  Mean: {sum(single_block_norms) / len(single_block_norms):.6f}")
-        print(f"  Std:  {float(jnp.std(jnp.array(single_block_norms))):.6f}")
-        print(f"  Range: [{min(single_block_norms):.6f}, {max(single_block_norms):.6f}]")
+        print(f"  Mean: {sum(single_norms_only) / len(single_norms_only):.6f}")
+        print(f"  Std:  {float(jnp.std(jnp.array(single_norms_only))):.6f}")
+        print(f"  Range: [{min(single_norms_only):.6f}, {max(single_norms_only):.6f}]")
     
     print("\n  → High variance suggests MHC could stabilize training")
     
