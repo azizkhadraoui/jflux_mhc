@@ -292,7 +292,7 @@ def train_baseline(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
         warmup_steps=config.warmup_steps,
         decay_steps=config.steps,
     )
-    optimizer = nnx.Optimizer(model.model, optax.adam(schedule))
+    optimizer = nnx.Optimizer(model.model, optax.adam(schedule), wrt=nnx.Param)
     
     metrics = {"loss": [], "step_time": []}
     
@@ -352,7 +352,7 @@ def train_static_alpha(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
         warmup_steps=config.warmup_steps,
         decay_steps=config.steps,
     )
-    optimizer = nnx.Optimizer(wrapper.model, optax.adam(schedule))
+    optimizer = nnx.Optimizer(wrapper.model, optax.adam(schedule), wrt=nnx.Param)
     
     metrics = {"loss": [], "step_time": []}
     alphas = wrapper.alphas
@@ -442,7 +442,7 @@ def train_dynamic_mhc(config: TrainConfig, key: jax.random.PRNGKey) -> dict:
         warmup_steps=config.warmup_steps,
         decay_steps=config.steps,
     )
-    model_optimizer = nnx.Optimizer(wrapper.model, optax.adam(schedule))
+    model_optimizer = nnx.Optimizer(wrapper.model, optax.adam(schedule), wrt=nnx.Param)
     
     # Separate optimizer for alpha logits (higher LR)
     alpha_optimizer = optax.adam(0.01)
