@@ -52,8 +52,8 @@ class AnalysisConfig:
     use_full_mhc: bool = False
     
     # Training config (for probe)
-    probe_steps: int = 100
-    probe_lr: float = 1e-3
+    probe_steps: int = 200
+    probe_lr: float = 0.1  # Higher LR since we're only training 12 scalars
     
     # W&B config
     wandb_project: str = "mhc-flux-analysis"
@@ -460,6 +460,8 @@ def run_probe_training(config: AnalysisConfig):
     
     This tests if cross-layer connections learn useful patterns.
     """
+    import optax
+    
     print("=" * 60)
     print("PROBE TRAINING (MHC only)")
     print("=" * 60)
@@ -475,135 +477,140 @@ def run_probe_training(config: AnalysisConfig):
     params = get_tiny_flux_params(config, rngs)
     model = Flux(params)
     
-    # Create MHC manager
+    # Create simple trainable alpha parameters (one per block)
     total_blocks = config.depth + config.depth_single_blocks
-    mhc_manager = HyperConnectionManager(
-        num_blocks=total_blocks,
-        hidden_size=config.hidden_size,
-        history_len=config.history_len,
-        rngs=rngs,
-        use_full_mhc=config.use_full_mhc,
-    )
     
-    print(f"Created MHC manager with {total_blocks} connections")
-    print(f"  - History length: {config.history_len}")
-    print(f"  - Full MHC: {config.use_full_mhc}")
+    # Initialize alpha logits (will be passed through sigmoid)
+    # Start at ~0.9 (logit of 0.9 ≈ 2.2)
+    init_logit = float(jnp.log(jnp.array(0.9) / (1 - 0.9)))
+    alpha_logits = jnp.ones(total_blocks) * init_logit
+    
+    print(f"Created {total_blocks} trainable alpha parameters")
+    print(f"  - Initial alpha (all blocks): {float(nnx.sigmoid(alpha_logits[0])):.4f}")
     
     # Log initial alphas
-    initial_alphas = mhc_manager.get_all_alphas()
-    if initial_alphas:
-        for i, alpha in enumerate(initial_alphas):
-            wandb.log({"mhc/initial_alpha": alpha, "block_idx": i})
-        print(f"  - Initial alpha (all blocks): {initial_alphas[0]:.4f}")
+    initial_alphas = [float(nnx.sigmoid(a)) for a in alpha_logits]
+    for i, alpha in enumerate(initial_alphas):
+        wandb.log({"mhc/initial_alpha": alpha, "block_idx": i})
     
-    # Training loop
-    import optax
-    
-    # Only optimize MHC parameters
-    mhc_params = []
-    for conn in mhc_manager.connections:
-        mhc_params.append(nnx.state(conn))
-    
+    # Setup optimizer
     optimizer = optax.adam(config.probe_lr)
+    opt_state = optimizer.init(alpha_logits)
     
     print(f"\nTraining for {config.probe_steps} steps...")
     
+    def forward_with_mhc(alpha_logits, batch):
+        """Forward pass using MHC connections with given alpha parameters."""
+        alphas = nnx.sigmoid(alpha_logits)
+        
+        # Process inputs
+        img = model.img_in(batch["img"])
+        txt = model.txt_in(batch["txt"])
+        vec = model.time_in(timestep_embedding(batch["timesteps"], 256))
+        vec = vec + model.vector_in(batch["y"])
+        
+        ids = jnp.concatenate((batch["txt_ids"], batch["img_ids"]), axis=1)
+        pe = model.pe_embedder(ids)
+        
+        # Double blocks with MHC
+        prev_img = None
+        block_idx = 0
+        for block in model.double_blocks.layers:
+            img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
+            # Apply simple hyper-connection: alpha * current + (1-alpha) * previous
+            if prev_img is not None:
+                alpha = alphas[block_idx]
+                img = alpha * img + (1 - alpha) * prev_img
+            prev_img = img
+            block_idx += 1
+        
+        # Single blocks with MHC  
+        img = jnp.concatenate((txt, img), axis=1)
+        prev_single = None
+        for block in model.single_blocks.layers:
+            img = block(img, vec=vec, pe=pe)
+            # Apply simple hyper-connection
+            if prev_single is not None:
+                alpha = alphas[block_idx]
+                img = alpha * img + (1 - alpha) * prev_single
+            prev_single = img
+            block_idx += 1
+        
+        img = img[:, batch["txt"].shape[1]:, ...]
+        img = model.final_layer(img, vec)
+        
+        return jnp.mean(img ** 2)
+    
+    # Training loop with actual gradient updates
     for step in range(config.probe_steps):
         batch = create_dummy_batch(config, nnx.Rngs(default=step))
         
-        def forward_with_mhc(batch):
-            """Forward pass using MHC connections."""
-            mhc_manager.reset()
-            
-            # Process inputs
-            img = model.img_in(batch["img"])
-            txt = model.txt_in(batch["txt"])
-            vec = model.time_in(timestep_embedding(batch["timesteps"], 256))
-            vec = vec + model.vector_in(batch["y"])
-            
-            ids = jnp.concatenate((batch["txt_ids"], batch["img_ids"]), axis=1)
-            pe = model.pe_embedder(ids)
-            
-            # Double blocks with MHC
-            block_idx = 0
-            for block in model.double_blocks.layers:
-                img, txt = block(img=img, txt=txt, vec=vec, pe=pe)
-                img = mhc_manager.apply(block_idx, img)
-                block_idx += 1
-            
-            # Single blocks with MHC  
-            img = jnp.concatenate((txt, img), axis=1)
-            # Reset history since shape changed (img only -> txt+img concatenated)
-            mhc_manager.reset()
-            for block in model.single_blocks.layers:
-                img = block(img, vec=vec, pe=pe)
-                img = mhc_manager.apply(block_idx, img)
-                block_idx += 1
-            
-            img = img[:, batch["txt"].shape[1]:, ...]
-            img = model.final_layer(img, vec)
-            
-            return jnp.mean(img ** 2)
+        # Compute loss and gradients
+        loss, grads = jax.value_and_grad(forward_with_mhc)(alpha_logits, batch)
         
-        loss = forward_with_mhc(batch)
+        # Update alpha_logits using optimizer
+        updates, opt_state = optimizer.update(grads, opt_state, alpha_logits)
+        alpha_logits = optax.apply_updates(alpha_logits, updates)
         
         # Log progress
         if step % 10 == 0:
-            alphas = mhc_manager.get_all_alphas()
+            current_alphas = [float(nnx.sigmoid(a)) for a in alpha_logits]
             
             wandb.log({
                 "train/loss": float(loss),
                 "train/step": step,
+                "train/grad_norm": float(jnp.linalg.norm(grads)),
             })
             
-            if alphas:
-                wandb.log({
-                    "mhc/alpha_mean": sum(alphas) / len(alphas),
-                    "mhc/alpha_std": float(jnp.std(jnp.array(alphas))),
-                    "mhc/alpha_min": min(alphas),
-                    "mhc/alpha_max": max(alphas),
-                })
-                
-                print(f"Step {step:4d} | Loss: {float(loss):.6f} | "
-                      f"α mean: {sum(alphas)/len(alphas):.4f} | "
-                      f"α range: [{min(alphas):.4f}, {max(alphas):.4f}]")
+            wandb.log({
+                "mhc/alpha_mean": sum(current_alphas) / len(current_alphas),
+                "mhc/alpha_std": float(jnp.std(jnp.array(current_alphas))),
+                "mhc/alpha_min": min(current_alphas),
+                "mhc/alpha_max": max(current_alphas),
+            })
+            
+            print(f"Step {step:4d} | Loss: {float(loss):.6f} | "
+                  f"grad_norm: {float(jnp.linalg.norm(grads)):.6f} | "
+                  f"α mean: {sum(current_alphas)/len(current_alphas):.4f} | "
+                  f"α range: [{min(current_alphas):.4f}, {max(current_alphas):.4f}]")
     
     # Final analysis
-    final_alphas = mhc_manager.get_all_alphas()
+    final_alphas = [float(nnx.sigmoid(a)) for a in alpha_logits]
     
     print("\n" + "=" * 60)
     print("PROBE TRAINING RESULTS")
     print("=" * 60)
     
-    if final_alphas:
-        print("\nLearned alpha values per block:")
-        for i, alpha in enumerate(final_alphas):
-            block_type = "double" if i < config.depth else "single"
-            local_idx = i if i < config.depth else i - config.depth
-            print(f"  Block {i:2d} ({block_type:6s} #{local_idx:2d}): α = {alpha:.4f}")
-            wandb.log({"mhc/final_alpha": alpha, "block_idx": i})
-        
-        # Key metric: did alphas diverge from initial?
-        avg_alpha = sum(final_alphas) / len(final_alphas)
-        alpha_variance = float(jnp.var(jnp.array(final_alphas)))
-        
-        wandb.log({
-            "summary/final_alpha_mean": avg_alpha,
-            "summary/final_alpha_variance": alpha_variance,
-            "summary/alpha_diverged_from_init": abs(avg_alpha - 0.9) > 0.05,
-        })
-        
-        print(f"\nSummary:")
-        print(f"  Average α: {avg_alpha:.4f} (initial: 0.9)")
-        print(f"  α variance: {alpha_variance:.6f}")
-        
-        if abs(avg_alpha - 0.9) > 0.05 or alpha_variance > 0.01:
-            print("\n  ✅ Alphas diverged from initialization!")
-            print("     → Cross-layer connections ARE learning useful patterns")
-            print("     → MHC is worth pursuing further")
-        else:
-            print("\n  ⚠️  Alphas stayed near initialization")
-            print("     → May need longer training or different setup")
+    print("\nLearned alpha values per block:")
+    for i, alpha in enumerate(final_alphas):
+        block_type = "double" if i < config.depth else "single"
+        local_idx = i if i < config.depth else i - config.depth
+        print(f"  Block {i:2d} ({block_type:6s} #{local_idx:2d}): α = {alpha:.4f}")
+        wandb.log({"mhc/final_alpha": alpha, "block_idx": i})
+    
+    # Key metric: did alphas diverge from initial?
+    avg_alpha = sum(final_alphas) / len(final_alphas)
+    alpha_variance = float(jnp.var(jnp.array(final_alphas)))
+    alpha_change = abs(avg_alpha - 0.9)
+    
+    wandb.log({
+        "summary/final_alpha_mean": avg_alpha,
+        "summary/final_alpha_variance": alpha_variance,
+        "summary/alpha_change_from_init": alpha_change,
+        "summary/alpha_diverged_from_init": alpha_change > 0.05 or alpha_variance > 0.001,
+    })
+    
+    print(f"\nSummary:")
+    print(f"  Average α: {avg_alpha:.4f} (initial: 0.9, change: {alpha_change:.4f})")
+    print(f"  α variance: {alpha_variance:.6f}")
+    
+    if alpha_change > 0.05 or alpha_variance > 0.001:
+        print("\n  ✅ Alphas diverged from initialization!")
+        print("     → Cross-layer connections ARE learning useful patterns")
+        print("     → MHC is worth pursuing further")
+    else:
+        print("\n  ⚠️  Alphas stayed near initialization")
+        print("     → May need longer training or different setup")
     
     wandb.finish()
     return final_alphas
